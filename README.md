@@ -62,7 +62,9 @@ The system is a multi-agent AI pipeline that analyzes Facebook Ads performance d
 
 
 
-\## 📂 Project Structure
+## 📁 Project Structure
+
+```text
 kasparro-agentic-fb-analyst-harika-guruju/
 │
 ├── src/
@@ -96,6 +98,7 @@ kasparro-agentic-fb-analyst-harika-guruju/
 ├── requirements.txt
 ├── README.md
 └── LICENSE
+```
 
 
 
