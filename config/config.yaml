@@ -6,3 +6,6 @@ data_csv: "data/synthetic_fb_ads_undergarments.csv"
 roas_drop_threshold_pct: 0.15
 low_ctr_threshold: 0.01
 min_impressions_for_stat: 50
+min_relative_drop_pct: 0.20
+min_impressions_for_insight: 500
+min_confidence: 0.6
