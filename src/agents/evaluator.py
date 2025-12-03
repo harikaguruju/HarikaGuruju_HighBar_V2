@@ -1,135 +1,106 @@
-import numpy as np
-from scipy import stats
+import logging
+from typing import Dict, Any, List
+
+logger = logging.getLogger(__name__)
+
 
 class Evaluator:
     """
-    Evaluator Agent:
-    Takes hypotheses from InsightAgent and validates them quantitatively using
-    available summary statistics (daily aggregates, campaign aggregates).
-    Returns validation records with simple statistical evidence.
+    High-bar evaluator that validates hypotheses using:
+    - Baseline vs current comparison
+    - Absolute and relative deltas
+    - Impact classification
+    - Confidence scoring
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg: Dict[str, Any]) -> None:
         self.cfg = cfg
+        self.min_relative_drop = cfg.get("min_relative_drop_pct", 0.20)
+        self.min_impressions = cfg.get("min_impressions_for_insight", 500)
+        self.min_confidence = cfg.get("min_confidence", 0.6)
 
-    def validate(self, hypotheses, summary):
+    def _classify_impact(self, relative_delta: float) -> str:
+        """Convert % drop into impact level."""
+        if relative_delta >= 0.40:
+            return "high"
+        elif relative_delta >= 0.25:
+            return "medium"
+        else:
+            return "low"
+
+    def _estimate_confidence(self, relative_delta: float, impressions: int) -> float:
         """
-        Validate each hypothesis and return a list of validation dicts:
-        {
-            "hypothesis_id": str,
-            "validated": bool,
-            "p_value": float or None,
-            "effect_size": float or None,
-            "evidence": str
-        }
+        Simple confidence heuristic using magnitude of change + data volume.
         """
-        validations = []
-        daily = summary.get("daily", [])
+        volume_factor = min(impressions / 5000, 1.0)
+        delta_factor = min(relative_delta / 0.5, 1.0)
+        confidence = round(0.5 * volume_factor + 0.5 * delta_factor, 2)
+        return confidence
+
+    def validate(
+        self,
+        hypotheses: List[Dict[str, Any]],
+        summary: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        Validate hypotheses using structured evidence:
+        - baseline vs current
+        - absolute + relative delta
+        - impact
+        - confidence
+        """
+
+        validated_results: List[Dict[str, Any]] = []
 
         for h in hypotheses:
-            hid = h.get("hypothesis_id")
-            evidence = ""
-            validated = False
-            p_value = None
-            effect = None
+            baseline_val = h["baseline"]
+            current_val = h["current"]
+            impressions = h.get("impressions", 0)
 
-            # Validate ROAS drop hypothesis by comparing last 7 vs prior 7 daily roas
-            if hid in ("h_roas_drop", "h_roas_drop"):
-                if len(daily) >= 14:
-                    prev7 = [d.get("roas", 0) for d in daily[-14:-7]]
-                    last7 = [d.get("roas", 0) for d in daily[-7:]]
-                    try:
-                        tstat, p_value = stats.ttest_ind(prev7, last7, equal_var=False, nan_policy="omit")
-                        roas_prev = np.mean(prev7)
-                        roas_last = np.mean(last7)
-                        effect = roas_prev - roas_last
-                        validated = (p_value is not None and p_value < 0.1 and effect > 0)
-                        evidence = f"prev_mean={roas_prev:.3f}, last_mean={roas_last:.3f}, p={p_value:.4f}"
-                    except Exception as e:
-                        evidence = f"t-test error: {str(e)}"
-                else:
-                    evidence = "Insufficient daily data (<14 days) to test ROAS windows."
+            if baseline_val == 0:
+                logger.warning(
+                    "Skipping hypothesis %s because baseline is zero",
+                    h["id"],
+                )
+                continue
 
-            # Validate creative low CTR hypotheses
-            elif hid.startswith("h_creative"):
-                # Attempt to extract campaign name from hypothesis text
-                txt = h.get("hypothesis", "")
-                campaign_name = None
-                import re
-                m = re.search(r"Campaign '(.+?)' has low CTR", txt)
-                if m:
-                    campaign_name = m.group(1)
-                # Look up campaign metrics in summary
-                campaign_list = summary.get("campaign", [])
-                match = None
-                for c in campaign_list:
-                    # try exact match, else substring match
-                    if campaign_name and c.get("campaign_name") == campaign_name:
-                        match = c
-                        break
-                if not match:
-                    low = summary.get("low_ctr_campaigns", [])
-                    match = low[0] if low else None
+            absolute_delta = current_val - baseline_val
+            relative_delta = abs(absolute_delta) / baseline_val
 
-                if match:
-                    ctr = match.get("ctr", 0)
-                    impressions = match.get("impressions", 0)
-                    validated = (ctr < self.cfg.get("low_ctr_threshold", 0.01)) and (impressions >= self.cfg.get("min_impressions_for_stat", 50))
-                    evidence = f"campaign_ctr={ctr:.4f}, impressions={impressions}"
-                else:
-                    evidence = "No matching campaign found in summary."
+            impact = self._classify_impact(relative_delta)
+            confidence = self._estimate_confidence(relative_delta, impressions)
 
-            # Validate audience saturation hypothesis by checking cost-per-impression change
-            elif hid == "h_audience_saturation":
-                if len(daily) >= 14:
-                    prev_spend = np.mean([d.get("spend", 0) for d in daily[-14:-7]])
-                    last_spend = np.mean([d.get("spend", 0) for d in daily[-7:]])
-                    prev_imp = np.mean([d.get("impressions", 0) for d in daily[-14:-7]])
-                    last_imp = np.mean([d.get("impressions", 0) for d in daily[-7:]])
-                    cp_prev = prev_spend / prev_imp if prev_imp > 0 else 0
-                    cp_last = last_spend / last_imp if last_imp > 0 else 0
-                    cp_change = (cp_last - cp_prev) / cp_prev if cp_prev > 0 else 0
-                    validated = cp_change > 0.1  # >10% increase in cost per impression signals saturation
-                    evidence = f"cp_prev={cp_prev:.3f}, cp_last={cp_last:.3f}, cp_change={cp_change:.3f}"
-                else:
-                    evidence = "Insufficient daily data to evaluate audience saturation."
+            validated = (
+                relative_delta >= self.min_relative_drop
+                and impressions >= self.min_impressions
+                and confidence >= self.min_confidence
+            )
 
-            # Default fallback (data quality / other)
-            elif hid == "h_data_quality":
-                # Basic check: if revenue drops but clicks/impressions do not, flag data issue
-                recent = summary.get("recent_summary", {})
-                overall_daily = daily
-                if overall_daily and recent:
-                    # compute average prior window (exclude last 7 if possible)
-                    if len(overall_daily) >= 14:
-                        prev7 = overall_daily[-14:-7]
-                        prev_revenue = np.mean([d.get("revenue", 0) for d in prev7])
-                        last7 = overall_daily[-7:]
-                        last_revenue = np.mean([d.get("revenue", 0) for d in last7])
-                        prev_clicks = np.mean([d.get("clicks", 0) for d in prev7])
-                        last_clicks = np.mean([d.get("clicks", 0) for d in last7])
-                        # If revenue drops a lot while clicks are stable, suspect tracking
-                        if prev_revenue > 0:
-                            rev_drop_pct = (prev_revenue - last_revenue) / prev_revenue
-                        else:
-                            rev_drop_pct = 0
-                        clicks_change = (last_clicks - prev_clicks) / prev_clicks if prev_clicks > 0 else 0
-                        validated = (rev_drop_pct > 0.2) and (abs(clicks_change) < 0.1)
-                        evidence = f"prev_rev={prev_revenue:.2f}, last_rev={last_revenue:.2f}, rev_drop_pct={rev_drop_pct:.2f}, clicks_change={clicks_change:.2f}"
-                    else:
-                        evidence = "Insufficient daily data to assess data-quality signals."
-                else:
-                    evidence = "No recent_summary or daily data present."
+            result = {
+                "hypothesis_id": h["id"],
+                "hypothesis": h["hypothesis"],
+                "segment": h["segment"],
+                "metric": h["metric"],
+                "evidence": {
+                    "baseline": baseline_val,
+                    "current": current_val,
+                    "absolute_delta": round(absolute_delta, 4),
+                    "relative_delta_pct": round(relative_delta * 100, 2),
+                    "impressions": impressions,
+                },
+                "impact": impact,
+                "confidence": confidence,
+                "validated": validated,
+            }
 
-            else:
-                evidence = "No validation logic for this hypothesis id."
+            logger.info(
+                "Evaluated hypothesis %s | impact=%s | confidence=%.2f | validated=%s",
+                h["id"],
+                impact,
+                confidence,
+                validated,
+            )
 
-            validations.append({
-                "hypothesis_id": hid,
-                "validated": bool(validated),
-                "p_value": None if p_value is None else float(p_value),
-                "effect_size": None if effect is None else float(effect),
-                "evidence": evidence
-            })
+            validated_results.append(result)
 
-        return validations
+        return validated_results
