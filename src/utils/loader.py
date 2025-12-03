@@ -5,8 +5,13 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+
+class DataLoaderError(Exception):
+    """Custom exception for CSV loading failures."""
+    pass
+
+
 # Minimal schema we expect from the FB ads dataset.
-# (If any of these are missing we fail fast with a clear error.)
 EXPECTED_COLUMNS: List[str] = [
     "date",
     "spend",
@@ -45,7 +50,7 @@ def validate_schema(
 
 def load_csv(
     path: str,
-    expected_columns: Optional[List[str]] = None,
+    required_columns: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
     Load a CSV with retries + schema validation.
@@ -60,22 +65,30 @@ def load_csv(
     Raises:
         FileNotFoundError: if the file does not exist.
         ValueError: if schema validation fails.
-        Exception: for repeated unexpected errors.
+        DataLoaderError: for repeated unexpected errors.
     """
-    if expected_columns is None:
-        expected_columns = EXPECTED_COLUMNS
+    if required_columns is None:
+        required_columns = EXPECTED_COLUMNS
 
-    # Simple retry loop to handle transient read errors.
     max_attempts = 3
     last_error: Optional[Exception] = None
 
     for attempt in range(1, max_attempts + 1):
         try:
-            logger.info("Loading CSV from %s (attempt %d/%d)", path, attempt, max_attempts)
+            logger.info(
+                "Loading CSV from %s (attempt %d/%d)",
+                path,
+                attempt,
+                max_attempts,
+            )
             df = pd.read_csv(path, parse_dates=["date"], infer_datetime_format=True)
-            logger.info("CSV loaded successfully: %d rows x %d columns", df.shape[0], df.shape[1])
+            logger.info(
+                "CSV loaded successfully: %d rows x %d columns",
+                df.shape[0],
+                df.shape[1],
+            )
 
-            validate_schema(df, expected_columns)
+            validate_schema(df, required_columns)
 
             if df.empty:
                 logger.error("Loaded CSV is empty after reading: %s", path)
@@ -84,14 +97,23 @@ def load_csv(
             return df
 
         except FileNotFoundError:
+            # No point retrying if the file itself is missing
             logger.error("Data file not found at path: %s", path)
-            raise  # no point retrying
+            raise
 
         except Exception as exc:  # noqa: BLE001
             last_error = exc
-            logger.exception("Unexpected error while loading CSV (attempt %d)", attempt)
+            logger.exception(
+                "Unexpected error while loading CSV (attempt %d)", attempt
+            )
+            # Wrap in our custom error so callers & tests can assert on it.
+            raise DataLoaderError(f"CSV loading failed: {exc}")
 
     # If we reach here, all attempts failed.
     assert last_error is not None
-    logger.error("Failed to load CSV after %d attempts. Last error: %s", max_attempts, last_error)
-    raise last_error
+    logger.error(
+        "Failed to load CSV after %d attempts. Last error: %s",
+        max_attempts,
+        last_error,
+    )
+    raise DataLoaderError(f"All retries failed. Last error: {last_error}")
